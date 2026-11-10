@@ -1032,3 +1032,964 @@ async def migrate_from_json(path: str = "bot_database.json") -> None:
 
 # ═══ PART 1 ENDS HERE ═══
 # Merge point: Part 2 continues directly below.
+═════════════════════════════════════════════════════════════════
+#  OTP POLL LOOP
+# ══════════════════════════════════════════════════════════════════
+
+async def poll_all_databases(bot) -> None:
+    global first_run
+    session = await get_session()
+    stale_mins = await gsint("otp_stale_mins", OTP_STALE_MINS)
+    rate_limit = await gsint("otp_rate_limit", OTP_RATE_LIMIT)
+    maintenance = await gsbool("maintenance_mode", False)
+    if maintenance: return
+
+    # Load blacklist
+    async with db() as c:
+        bl_rows = c.execute("SELECT phone FROM number_blacklist").fetchall()
+    blacklist = {r["phone"] for r in bl_rows}
+
+    # Load OTP alert format
+    async with db() as c:
+        fmt_row = c.execute("SELECT template FROM otp_format WHERE id=1").fetchone()
+    otp_fmt = fmt_row["template"] if fmt_row else "📡 <b>NEW OTP</b>\n📱 {phone}\n🔑 {otp}\n🗄 {db}\n🕐 {time}"
+
+    async def _poll_one(name: str, url: str) -> None:
+        # Get custom path for this DB
+        async with db() as c:
+            meta = c.execute("SELECT custom_path FROM db_meta WHERE db_name=?", (name,)).fetchone()
+        custom_path = meta["custom_path"] if meta else ""
+
+        try:
+            entries = await fetch_firebase(url, session, custom_path)
+        except Exception as e:
+            log.debug("Poll error %s: %s", name, e)
+            return
+
+        for entry in entries:
+            uid = entry.get("_key", "")
+            phone, otp = extract_otp(entry)
+
+            # Skip if no data
+            if not phone and not otp:
+                continue
+
+            # Skip stale
+            if is_stale(entry, stale_mins):
+                if uid: seen_ids.add(uid)
+                continue
+
+            # Skip duplicate
+            if is_duplicate(phone, otp, name, uid):
+                continue
+
+            # First run — seed seen IDs only
+            if first_run:
+                continue
+
+            # Skip blacklisted number
+            if phone in blacklist:
+                continue
+
+            # Rate limit per DB
+            if not check_rate_limit(name, rate_limit):
+                log.debug("Rate limit hit for DB: %s", name)
+                continue
+
+            # Build alert
+            raw_msg = entry.get("message") or entry.get("body") or entry.get("text") or ""
+            alert = (
+                f"<blockquote>{'━'*22}\n"
+                f"📡 <b>NEW OTP RECEIVED</b>\n"
+                f"{'━'*22}</blockquote>\n\n"
+                f"<blockquote>"
+                f"🗄 <b>DB:</b> {he(name)}\n"
+                f"📱 <b>Phone:</b> <code>{he(phone)}</code>\n"
+                f"🔑 <b>OTP:</b> <code>{he(otp)}</code>\n"
+                f"💬 <b>Msg:</b> <code>{he(str(raw_msg)[:200])}</code>\n"
+                f"🕐 <b>Time:</b> {datetime.now().strftime('%d %b %Y %H:%M:%S')}"
+                f"</blockquote>"
+            )
+
+            # Copy button
+            copy_kb = None
+            if otp and _COPY_BTN:
+                try:
+                    copy_kb = InlineKeyboardMarkup([[_COPY_BTN(otp)]])
+                except Exception:
+                    copy_kb = None
+
+            # Targets: allowed users + admins
+            targets = set(allowed_users) | ADMIN_IDS
+
+            # Forward channel
+            fwd_ch = await get_setting("forward_channel", "")
+
+            # Send to targets
+            for tid in targets:
+                try:
+                    await bot.send_message(tid, alert,
+                        parse_mode=ParseMode.HTML, reply_markup=copy_kb)
+                except (Forbidden, BadRequest):
+                    pass
+                except RetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
+                except TelegramError as e:
+                    log.debug("Send error to %d: %s", tid, e)
+
+            # Forward to channel
+            if fwd_ch:
+                try:
+                    await bot.send_message(int(fwd_ch), alert, parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+
+            # Live monitor broadcast
+            if otp:
+                await broadcast_otp(bot, phone, otp, name, otp_fmt)
+
+            # Log to User Hub for all targets
+            for tid in targets:
+                try:
+                    await log_number_used(tid, phone, otp, name, url)
+                except Exception:
+                    pass
+
+            # Analytics
+            await log_otp_analytics(name, phone, otp)
+            await log_act(0, "otp_received", f"{name}|{phone}|{otp}")
+
+    tasks = [_poll_one(name, url) for name, url in list(DATABASES.items())]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    first_run = False
+
+
+async def poll_loop(bot) -> None:
+    log.info("Poll loop started")
+    while True:
+        try:
+            interval = await gsint("poll_interval", POLL_INTERVAL)
+            await poll_all_databases(bot)
+            await asyncio.sleep(max(5, interval))
+        except asyncio.CancelledError:
+            log.info("Poll loop cancelled"); break
+        except Exception as e:
+            log.error("Poll loop error: %s", e)
+            await asyncio.sleep(10)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  BACKGROUND TASKS
+# ══════════════════════════════════════════════════════════════════
+
+async def auto_backup_loop(bot) -> None:
+    log.info("Auto backup loop started")
+    while True:
+        try:
+            if await gsbool("auto_db_enabled", False):
+                interval = await gsint("auto_db_interval", 3600)
+                # Primary target
+                target_raw = await get_setting("auto_db_group", "")
+                if target_raw:
+                    try: await send_backup(bot, int(target_raw))
+                    except Exception as e: log.error("Auto backup primary: %s", e)
+                # Multi targets
+                extra = await gsjson("multi_backup_targets", [])
+                for t in extra:
+                    try: await send_backup(bot, int(t))
+                    except Exception: pass
+                await asyncio.sleep(max(300, interval))
+            else:
+                await asyncio.sleep(60)
+        except asyncio.CancelledError: break
+        except Exception as e:
+            log.error("Backup loop: %s", e); await asyncio.sleep(60)
+
+
+async def health_loop(bot) -> None:
+    log.info("Firebase health loop started")
+    while True:
+        try:
+            session = await get_session()
+            results = await run_health_check(session)
+            alive = sum(1 for s in results.values() if s=="alive")
+            dead  = sum(1 for s in results.values() if s=="dead")
+            log.info("Firebase health: %d alive, %d dead", alive, dead)
+
+            # Alert admin if many dead
+            if dead > 5:
+                for aid in ADMIN_IDS:
+                    try:
+                        await bot.send_message(aid,
+                            f"⚠️ <b>Firebase Alert:</b> {dead} DBs are dead!\n"
+                            f"🟢 Alive: {alive} | 🔴 Dead: {dead}",
+                            parse_mode=ParseMode.HTML)
+                    except Exception: pass
+
+            await asyncio.sleep(FB_HEALTH_INTERVAL)
+        except asyncio.CancelledError: break
+        except Exception as e:
+            log.error("Health loop: %s", e); await asyncio.sleep(60)
+
+
+async def ban_expiry_loop() -> None:
+    """Auto-unban expired temp bans."""
+    while True:
+        try:
+            now = datetime.utcnow()
+            to_unban = []
+            for uid, info in list(banned_users.items()):
+                if info.get("until"):
+                    try:
+                        if datetime.fromisoformat(info["until"]) < now:
+                            to_unban.append(uid)
+                    except: pass
+            for uid in to_unban:
+                await unban_user(uid)
+                log.info("Auto-unbanned %d (temp ban expired)", uid)
+            await asyncio.sleep(60)
+        except asyncio.CancelledError: break
+        except Exception as e:
+            log.error("Ban expiry loop: %s", e); await asyncio.sleep(60)
+
+
+async def health_server() -> None:
+    from aiohttp import web
+    async def _h(req):
+        return web.Response(
+            text=json.dumps({
+                "status": "ok", "version": BOT_VERSION,
+                "dbs": len(DATABASES), "users": len(allowed_users),
+            }),
+            content_type="application/json",
+        )
+    app = web.Application()
+    app.router.add_get("/", _h)
+    app.router.add_get("/health", _h)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", HEALTH_CHECK_PORT).start()
+    log.info("Health server on :%d", HEALTH_CHECK_PORT)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ACCESS GUARD
+# ══════════════════════════════════════════════════════════════════
+
+async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user: return False
+    await ensure_user(user.id, user.username, user.first_name)
+
+    if is_banned(user.id):
+        info = banned_users.get(user.id, {})
+        reason = info.get("reason") or "No reason given"
+        until  = fmt_dt(info.get("until")) if info.get("until") else "Permanent"
+        text = (f"<blockquote>{'━'*22}\n🚫 <b>YOU ARE BANNED</b>\n{'━'*22}</blockquote>\n\n"
+                f"<blockquote>❌ <b>Reason:</b> {he(reason)}\n"
+                f"⏱ <b>Until:</b> {until}</blockquote>")
+        if update.message: await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+        elif update.callback_query:
+            await update.callback_query.answer("🚫 You are banned", show_alert=True)
+        return False
+
+    if await has_access(user.id): return True
+
+    # No access
+    ref_link = f"https://t.me/{BOT_USERNAME.lstrip('@')}?start=ref_{user.id}"
+    req   = await gsint("required_referrals", 2)
+    count = await referral_count(user.id)
+    owner = await get_setting("owner_contact", OWNER_CONTACT)
+    text = (
+        f"<blockquote>{'━'*22}\n🔒 <b>ACCESS REQUIRED</b>\n{'━'*22}</blockquote>\n\n"
+        f"<blockquote>"
+        f"⚡ You need access to use this panel.\n\n"
+        f"📨 <b>Option 1:</b> Contact {he(owner)}\n\n"
+        f"🔗 <b>Option 2:</b> Refer {req} friends:\n"
+        f"<code>{he(ref_link)}</code>\n\n"
+        f"👥 Your referrals: <b>{count}/{req}</b>"
+        f"</blockquote>"
+    )
+    kb = InlineKeyboardMarkup([[
+        _ikb("👑 Contact Owner", url=f"https://t.me/{OWNER_CONTACT.lstrip('@')}", style="primary"),
+    ]])
+    if update.callback_query:
+        await update.callback_query.answer("🔒 Access required", show_alert=True)
+    elif update.message:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /start
+# ══════════════════════════════════════════════════════════════════
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user: return
+    is_new = await ensure_user(user.id, user.username, user.first_name)
+    await log_act(user.id, "start")
+
+    # Referral
+    args = context.args or []
+    if args and args[0].startswith("ref_"):
+        try:
+            ref_id = int(args[0][4:])
+            if ref_id != user.id:
+                async with db() as c:
+                    row = c.execute("SELECT referrals FROM all_users WHERE user_id=?", (ref_id,)).fetchone()
+                    refs = json.loads(row["referrals"] or "[]") if row else []
+                    if str(user.id) not in [str(x) for x in refs]:
+                        refs.append(user.id)
+                        c.execute("UPDATE all_users SET referrals=? WHERE user_id=?",
+                                  (json.dumps(refs), ref_id))
+        except Exception: pass
+
+    text, media_id, media_type = await build_welcome(user)
+    admin = is_admin(user.id)
+    kb = main_menu_kb(admin)
+
+    await send_rich_or_fallback(context.bot, user.id, text,
+        media_id, media_type, reply_markup=kb)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /panel
+# ══════════════════════════════════════════════════════════════════
+
+async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await guard(update, context): return
+    alive = sum(1 for h in _fb_health.values() if h.get("status")=="alive")
+    dead  = sum(1 for h in _fb_health.values() if h.get("status")=="dead")
+    brand = await get_setting("bot_brand_name", BOT_BRAND_NAME)
+    text = ui_screen("📡", f"{brand} — OTP Panel",
+        ui_box(
+            ui_kv("🗄","Total DBs",    str(len(DATABASES))),
+            ui_kv("🟢","Alive",        str(alive)),
+            ui_kv("🔴","Dead",         str(dead)),
+            ui_kv("👥","Allowed Users",str(len(allowed_users))),
+        ),
+        ui_box(f"💬 <i>{he(random.choice(PANEL_QUOTES))}</i>"),
+        subtitle="Select a database to view",
+        footer=f"🕐 {datetime.now().strftime('%H:%M:%S')}",
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML,
+        reply_markup=db_panel_kb(0))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /status
+# ══════════════════════════════════════════════════════════════════
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await guard(update, context): return
+    alive = sum(1 for h in _fb_health.values() if h.get("status")=="alive")
+    dead  = sum(1 for h in _fb_health.values() if h.get("status")=="dead")
+    poll_int = await gsint("poll_interval", POLL_INTERVAL)
+    maint    = await gsbool("maintenance_mode", False)
+    mon_on   = update.effective_user.id in _monitor_subs
+    text = ui_screen("📊","System Status",
+        ui_box(
+            ui_kv("🗄","Total DBs",   str(len(DATABASES))),
+            ui_kv("🟢","Alive",       str(alive)),
+            ui_kv("🔴","Dead",        str(dead)),
+            ui_kv("👥","Allowed",     str(len(allowed_users))),
+        ),
+        ui_box(
+            ui_kv("⏱","Poll Interval",f"{poll_int}s"),
+            ui_kv("👁","Seen IDs",    str(len(seen_ids))),
+            ui_status("Live Monitor",  mon_on),
+            ui_status("Maintenance",   maint),
+        ),
+        footer=f"🕐 {datetime.now().strftime('%d %b %Y %H:%M:%S')}",
+    )
+    kb = InlineKeyboardMarkup([
+        [_ikb("🔥 Run Health Check", callback_data="db:health",      style="success"),
+         _ikb("📡 Toggle Monitor",   callback_data="monitor:toggle", style="primary")],
+        [_ikb("🔄 Refresh",          callback_data="status:refresh", style="primary")],
+    ])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /hub — USER HUB
+# ══════════════════════════════════════════════════════════════════
+
+async def cmd_hub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await guard(update, context): return
+    await _show_hub(update, context, update.effective_user.id, 0, edit=False)
+
+
+async def _show_hub(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                    uid: int, page: int, edit: bool = False) -> None:
+    stats = await get_user_hub_stats(uid)
+    rows, total = await get_user_hub(uid, page, 8)
+    total_pages = max(1, (total+7)//8)
+
+    if rows:
+        lines = []
+        for r in rows:
+            ts    = r.get("timestamp","")[:16].replace("T"," ")
+            phone = r.get("phone") or "—"
+            otp   = r.get("otp")   or "—"
+            dbn   = r.get("db_name") or "—"
+            lines.append(
+                f"📱 <code>{he(phone)}</code> | 🔑 <code>{he(otp)}</code>\n"
+                f"   🗄 {he(dbn[:20])} · 🕐 {ts}"
+            )
+        entries = ui_box("\n\n".join(lines))
+    else:
+        entries = ui_box("📭 No number history yet.")
+
+    text = ui_screen("👤","User Hub",
+        ui_box(
+            ui_kv("📊","Total Hits",    str(stats["total"])),
+            ui_kv("📱","Unique Numbers",str(stats["unique_phones"])),
+            ui_kv("🕐","Last Active",   fmt_dt(stats["last_active"])),
+        ),
+        entries,
+        subtitle=f"Page {page+1} of {total_pages}",
+    )
+    nav = []
+    if page > 0:
+        nav.append(_ikb("⬅️", callback_data=f"hub:page:{page-1}", style="primary"))
+    nav.append(_ikb(f"{page+1}/{total_pages}", callback_data="noop", style="primary"))
+    if page < total_pages-1:
+        nav.append(_ikb("➡️", callback_data=f"hub:page:{page+1}", style="primary"))
+
+    rows_kb = []
+    if nav: rows_kb.append(nav)
+    rows_kb.append([
+        _ikb("🔍 Search Number", callback_data="hub:search",  style="success"),
+        _ikb("📤 Export CSV",    callback_data="hub:export",  style="primary"),
+    ])
+    rows_kb.append([_ikb("🗑 Clear History", callback_data="hub:clear", style="danger")])
+    rows_kb.append(back_row("home"))
+    kb = InlineKeyboardMarkup(rows_kb)
+
+    if edit and update.callback_query:
+        try: await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except BadRequest: pass
+    else:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /admin
+# ══════════════════════════════════════════════════════════════════
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admins only."); return
+    brand = await get_setting("bot_brand_name", BOT_BRAND_NAME)
+    alive = sum(1 for h in _fb_health.values() if h.get("status")=="alive")
+    async with db() as c:
+        total_users = c.execute("SELECT COUNT(*) FROM all_users").fetchone()[0]
+    text = ui_screen("👑", f"{brand} — Admin Panel",
+        ui_box(
+            ui_kv("🗄","Total DBs",   str(len(DATABASES))),
+            ui_kv("🟢","Alive",       str(alive)),
+            ui_kv("👥","Total Users", str(total_users)),
+            ui_kv("🔑","Allowed",     str(len(allowed_users))),
+            ui_kv("🚫","Banned",      str(len(banned_users))),
+            ui_kv("👑","Admins",      str(len(ADMIN_IDS))),
+        ),
+        footer="Select a section below",
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu_kb())
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /help
+# ══════════════════════════════════════════════════════════════════
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    brand = await get_setting("bot_brand_name", BOT_BRAND_NAME)
+    text = ui_screen("❓", f"{brand} — Help",
+        ui_box(
+            "📡 <b>Panel</b> — Browse all DBs + live status",
+            "📊 <b>Status</b> — System health overview",
+            "👤 <b>My Hub</b> — Your full number history",
+            "❓ <b>Help</b> — This screen",
+        ),
+        ui_box(
+            "🗄 <b>DB Manager</b> — Add/remove/view DBs",
+            "🔥 <b>Firebase Health</b> — Ping all DBs live",
+            "📡 <b>Live Monitor</b> — Real-time OTP alerts",
+            "💾 <b>Backup</b> — Manual/auto gzip backups",
+            "🧬 <b>Clone Manager</b> — Duplicate DB configs",
+            "🎨 <b>Customize</b> — Welcome text + media (A/B)",
+            "👥 <b>Users</b> — Grant/revoke access + tiers",
+            "🚫 <b>Ban Manager</b> — Temp/perm ban system",
+            "📊 <b>Analytics</b> — OTP stats + peak hours",
+            "⚙️ <b>Settings</b> — Full bot config",
+        ),
+        ui_box(
+            "/grant UID · /revoke UID · /ban UID [hours] [reason]",
+            "/unban UID · /adddb NAME URL · /removedb NAME",
+            "/backup · /monitor · /health · /stats · /addadmin UID",
+        ),
+    )
+    await update.message.reply_text(text, parse_
+    ══════════════════════════════════════════════════════════════════
+#  MASTER CALLBACK HANDLER
+# ══════════════════════════════════════════════════════════════════
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q    = update.callback_query
+    data = q.data or ""
+    user = q.from_user
+    await q.answer()
+
+    # ── noop ───────────────────────────────────────────────────
+    if data == "noop":
+        return
+
+    # ── home ───────────────────────────────────────────────────
+    if data == "home":
+        admin = is_admin(user.id)
+        try: await q.message.delete()
+        except Exception: pass
+        await context.bot.send_message(user.id, "🏠 Main Menu",
+            reply_markup=main_menu_kb(admin))
+        return
+
+    # ── admin:home ─────────────────────────────────────────────
+    if data == "admin:home":
+        try: await q.message.delete()
+        except Exception: pass
+        brand = await get_setting("bot_brand_name", BOT_BRAND_NAME)
+        await context.bot.send_message(user.id,
+            ui_screen("👑", f"{brand} — Admin Panel", ui_box("Select a section below")),
+            parse_mode=ParseMode.HTML, reply_markup=admin_menu_kb())
+        return
+
+    # ══ STATUS REFRESH ════════════════════════════════════════
+    if data == "status:refresh":
+        alive = sum(1 for h in _fb_health.values() if h.get("status")=="alive")
+        dead  = sum(1 for h in _fb_health.values() if h.get("status")=="dead")
+        poll_int = await gsint("poll_interval", POLL_INTERVAL)
+        maint    = await gsbool("maintenance_mode", False)
+        mon_on   = user.id in _monitor_subs
+        text = ui_screen("📊","System Status",
+            ui_box(
+                ui_kv("🗄","Total DBs",   str(len(DATABASES))),
+                ui_kv("🟢","Alive",       str(alive)),
+                ui_kv("🔴","Dead",        str(dead)),
+                ui_kv("👥","Allowed",     str(len(allowed_users))),
+            ),
+            ui_box(
+                ui_kv("⏱","Poll Interval",f"{poll_int}s"),
+                ui_kv("👁","Seen IDs",    str(len(seen_ids))),
+                ui_status("Live Monitor",  mon_on),
+                ui_status("Maintenance",   maint),
+            ),
+            footer=f"🕐 {datetime.now().strftime('%d %b %Y %H:%M:%S')}",
+        )
+        kb = InlineKeyboardMarkup([
+            [_ikb("🔥 Run Health Check", callback_data="db:health",      style="success"),
+             _ikb("📡 Toggle Monitor",   callback_data="monitor:toggle", style="primary")],
+            [_ikb("🔄 Refresh",          callback_data="status:refresh", style="primary")],
+        ])
+        try: await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except BadRequest: pass
+        return
+
+    # ══ DB MANAGER ════════════════════════════════════════════
+    if data.startswith("db:page:"):
+        if not is_admin(user.id): return
+        page = int(data.split(":")[-1])
+        try: await q.edit_message_reply_markup(reply_markup=db_panel_kb(page))
+        except BadRequest: pass
+        return
+
+    if data.startswith("db:view:"):
+        safe_name = data[8:]
+        # Reverse safe_cb to find original name
+        name = next((n for n in DATABASES if safe_cb(n)==safe_name), safe_name)
+        url  = DATABASES.get(name, "")
+        h    = _fb_health.get(name, {})
+        icon = db_status_icon(name)
+        async with db() as c:
+            meta = c.execute("SELECT notes,tag,priority FROM db_meta WHERE db_name=?", (name,)).fetchone()
+        notes    = meta["notes"]    if meta else ""
+        tag      = meta["tag"]      if meta else ""
+        priority = meta["priority"] if meta else 0
+        last_check = "—"
+        if h.get("last_check"):
+            last_check = datetime.fromtimestamp(h["last_check"]).strftime("%H:%M:%S")
+        text = ui_screen(icon, f"DB: {name}",
+            ui_box(
+                ui_kv("🔗","URL",    f"<code>{he(url[:60])}</code>"),
+                ui_kv("📊","Status", (h.get("status","unknown")).upper()),
+                ui_kv("🕐","Checked",last_check),
+                ui_kv("🏷","Tag",    he(tag) if tag else "—"),
+                ui_kv("⭐","Priority",str(priority)),
+            ),
+            ui_box(f"📝 {he(notes)}") if notes else "",
+        )
+        kb = InlineKeyboardMarkup([
+            [_ikb("🔥 Ping",        callback_data=f"db:ping:{safe_name}",       style="success"),
+             _ikb("🧬 Clone",       callback_data=f"db:clone_this:{safe_name}", style="primary")],
+            [_ikb("📝 Add Notes",   callback_data=f"db:notes:{safe_name}",      style="primary"),
+             _ikb("🗑 Remove",      callback_data=f"db:remove:{safe_name}",     style="danger")],
+            back_row("admin:home"),
+        ])
+        try: await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except BadRequest: pass
+        return
+
+    if data.startswith("db:ping:"):
+        safe_name = data[8:]
+        name = next((n for n in DATABASES if safe_cb(n)==safe_name), safe_name)
+        url  = DATABASES.get(name, "")
+        if not url: await q.answer("DB not found", show_alert=True); return
+        session = await get_session()
+        alive = await _ping_fb(url, session)
+        status = "🟢 ALIVE" if alive else "🔴 DEAD"
+        _fb_health[name] = {"status":"alive" if alive else "dead", "last_check":time.time(), "url":url}
+        await q.answer(f"{name}: {status}", show_alert=True)
+        return
+
+    if data.startswith("db:remove:"):
+        if not is_admin(user.id): return
+        safe_name = data[10:]
+        name = next((n for n in DATABASES if safe_cb(n)==safe_name), safe_name)
+        DATABASES.pop(name, None)
+        _fb_health.pop(name, None)
+        await q.answer(f"✅ Removed {name}")
+        try: await q.edit_message_reply_markup(reply_markup=db_panel_kb(0))
+        except BadRequest: pass
+        return
+
+    if data == "db:health":
+        if not is_admin(user.id): return
+        await q.answer("⏳ Checking...")
+        session = await get_session()
+        results = await run_health_check(session)
+        alive = sum(1 for s in results.values() if s=="alive")
+        dead  = sum(1 for s in results.values() if s=="dead")
+        await q.answer(f"✅ {alive} alive, {dead} dead", show_alert=True)
+        try: await q.edit_message_reply_markup(reply_markup=db_panel_kb(0))
+        except BadRequest: pass
+        return
+
+    if data == "db:remove_dead":
+        if not is_admin(user.id): return
+        count = await remove_dead_dbs()
+        await q.answer(f"🗑 Removed {count} dead DBs", show_alert=True)
+        try: await q.edit_message_reply_markup(reply_markup=db_panel_kb(0))
+        except BadRequest: pass
+        return
+
+    if data == "db:add":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"add_db"}
+        await context.bot.send_message(user.id,
+            "📥 <b>Send DB info:</b>\n\n<code>DB_NAME https://your-firebase-url</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if data == "db:import":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"import_dbs"}
+        await context.bot.send_message(user.id,
+            "📥 <b>Send JSON to import databases:</b>\n\n"
+            "<code>{\"DB_NAME\": \"https://url\", ...}</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if data.startswith("db:clone_this:"):
+        if not is_admin(user.id): return
+        safe_name = data[14:]
+        name = next((n for n in DATABASES if safe_cb(n)==safe_name), safe_name)
+        pending_action[user.id] = {"action":"clone_db"}
+        await context.bot.send_message(user.id,
+            f"🧬 <b>Clone:</b> <code>{he(name)}</code>\n\n"
+            f"Send: <code>{he(name)} NEW_NAME</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if data.startswith("db:notes:"):
+        if not is_admin(user.id): return
+        safe_name = data[9:]
+        name = next((n for n in DATABASES if safe_cb(n)==safe_name), safe_name)
+        pending_action[user.id] = {"action":"set_db_notes", "db_name":name}
+        await context.bot.send_message(user.id,
+            f"📝 <b>Add notes for:</b> <code>{he(name)}</code>\n\nSend your notes:",
+            parse_mode=ParseMode.HTML)
+        return
+
+    # ══ MONITOR ═══════════════════════════════════════════════
+    if data == "monitor:toggle":
+        new_state = await toggle_monitor(user.id)
+        await q.answer(f"📡 Monitor: {'🟢 ON' if new_state else '🔴 OFF'}", show_alert=True)
+        return
+
+    if data == "monitor:edit_fmt":
+        if not is_admin(user.id): return
+        async with db() as c:
+            fmt_row = c.execute("SELECT template FROM otp_format WHERE id=1").fetchone()
+        current = fmt_row["template"] if fmt_row else ""
+        pending_action[user.id] = {"action":"set_otp_format"}
+        await context.bot.send_message(user.id,
+            f"✏️ <b>Current OTP format:</b>\n<code>{he(current)}</code>\n\n"
+            f"<b>Variables:</b> <code>{{phone}}</code> <code>{{otp}}</code> "
+            f"<code>{{db}}</code> <code>{{time}}</code>\n\nSend new format:",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if data == "monitor:set_fwd":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"set_forward_channel"}
+        await context.bot.send_message(user.id,
+            "📡 <b>Send channel ID to forward OTPs:</b>\n<i>(e.g. -100xxxxxxxxx)</i>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    # ══ HUB ═══════════════════════════════════════════════════
+    if data.startswith("hub:page:"):
+        page = int(data.split(":")[-1])
+        await _show_hub(update, context, user.id, page, edit=True)
+        return
+
+    if data == "hub:clear":
+        async with db() as c:
+            c.execute("DELETE FROM user_hub WHERE user_id=?", (user.id,))
+        await q.answer("🗑 History cleared", show_alert=True)
+        await _show_hub(update, context, user.id, 0, edit=True)
+        return
+
+    if data == "hub:search":
+        pending_action[user.id] = {"action":"search_hub"}
+        await context.bot.send_message(user.id, "🔍 <b>Send phone number to search:</b>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if data == "hub:export":
+        async with db() as c:
+            rows = c.execute("SELECT phone,otp,db_name,timestamp FROM user_hub "
+                             "WHERE user_id=? ORDER BY timestamp DESC", (user.id,)).fetchall()
+        if not rows:
+            await q.answer("📭 No data to export", show_alert=True); return
+        lines = ["phone,otp,db_name,timestamp"]
+        for r in rows:
+            lines.append(f"{r['phone']},{r['otp'] or ''},{r['db_name'] or ''},{ r['timestamp']}")
+        csv_data = "\n".join(lines).encode()
+        fname = f"hub_export_{user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        await context.bot.send_document(user.id, io.BytesIO(csv_data), filename=fname,
+            caption=f"📤 <b>Hub Export</b> · {len(rows)} records",
+            parse_mode=ParseMode.HTML)
+        await q.answer("✅ Exported!")
+        return
+
+    # ══ BACKUP ════════════════════════════════════════════════
+    if data == "backup:now":
+        if not is_admin(user.id): return
+        await q.answer("⏳ Sending...")
+        ok = await send_backup(context.bot, user.id)
+        await q.answer("✅ Backup sent!" if ok else "❌ Failed", show_alert=True)
+        return
+
+    if data == "backup:toggle_auto":
+        if not is_admin(user.id): return
+        cur = await gsbool("auto_db_enabled", False)
+        await set_setting("auto_db_enabled", "0" if cur else "1")
+        await q.answer(f"Auto backup: {'OFF' if cur else 'ON'}", show_alert=True)
+        return
+
+    if data == "backup:set_target":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"set_backup_target"}
+        await context.bot.send_message(user.id,
+            "📤 <b>Send primary backup target chat ID:</b>", parse_mode=ParseMode.HTML)
+        return
+
+    if data == "backup:add_target":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"add_backup_target"}
+        await context.bot.send_message(user.id,
+            "➕ <b>Send additional backup target chat ID:</b>", parse_mode=ParseMode.HTML)
+        return
+
+    if data == "backup:extra_list":
+        if not is_admin(user.id): return
+        targets = await gsjson("multi_backup_targets", [])
+        lines   = [f"📤 <code>{t}</code>" for t in targets]
+        text    = ui_screen("📋","Extra Backup Targets",
+            ui_box("\n".join(lines) if lines else "📭 None added."))
+        try: await q.edit_message_text(text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([back_row("admin:home")]))
+        except BadRequest: pass
+        return
+
+    if data == "backup:history":
+        if not is_admin(user.id): return
+        history = await get_backup_history(10)
+        lines   = [f"📦 {fmt_dt(h['timestamp'])} · {fmt_size(h.get('size_bytes') or 0)}\n"
+                   f"   {he(h.get('filename','—'))}" for h in history]
+        text    = ui_screen("💾","Backup History",
+            ui_box("\n\n".join(lines) if lines else "📭 No backups yet."))
+        try: await q.edit_message_text(text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([back_row("admin:home")]))
+        except BadRequest: pass
+        return
+
+    # ══ CLONE ═════════════════════════════════════════════════
+    if data == "clone:start":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"clone_db"}
+        await context.bot.send_message(user.id,
+            "🧬 <b>Clone a DB</b>\n\nSend: <code>SOURCE_NAME NEW_NAME</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if data.startswith("clone:list:"):
+        if not is_admin(user.id): return
+        page  = int(data.split(":")[-1])
+        per   = 5
+        clones = await get_clones()
+        items  = clones[page*per:(page+1)*per]
+        total_pages = max(1,(len(clones)+per-1)//per)
+        lines  = [f"🧬 <b>{he(c['name'])}</b> ← {he(c.get('source_name') or '?')}\n"
+                  f"   📅 {fmt_dt(c.get('created_at'))}" for c in items]
+        text   = ui_screen("🧬","Clone List",
+            ui_box("\n\n".join(lines) if lines else "📭 None."),
+            subtitle=f"Page {page+1}/{total_pages}")
+        nav = []
+        if page > 0: nav.append(_ikb("⬅️", callback_data=f"clone:list:{page-1}", style="primary"))
+        if page < total_pages-1: nav.append(_ikb("➡️", callback_data=f"clone:list:{page+1}", style="primary"))
+        rows_kb = [nav] if nav else []
+        rows_kb.append(back_row("admin:home"))
+        try: await q.edit_message_text(text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows_kb))
+        except BadRequest: pass
+        return
+
+    # ══ CUSTOMIZE ═════════════════════════════════════════════
+    if data == "cust:text_a":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"set_welcome_text"}
+        await context.bot.send_message(user.id,
+            "✏️ <b>Send Welcome Text (A):</b>", parse_mode=ParseMode.HTML)
+        return
+
+    if data == "cust:text_b":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"set_welcome_text_b"}
+        await context.bot.send_message(user.id,
+            "✏️ <b>Send Welcome Text (B):</b>", parse_mode=ParseMode.HTML)
+        return
+
+    if data == "cust:media_a":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"set_welcome_media"}
+        await context.bot.send_message(user.id,
+            "🖼 <b>Send photo/video/GIF for Welcome (A):</b>", parse_mode=ParseMode.HTML)
+        return
+
+    if data == "cust:media_b":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"set_welcome_media_b"}
+        await context.bot.send_message(user.id,
+            "🖼 <b>Send photo/video/GIF for Welcome (B):</b>", parse_mode=ParseMode.HTML)
+        return
+
+    if data == "cust:clr_a":
+        if not is_admin(user.id): return
+        await clear_welcome_media("a")
+        await q.answer("🗑 Media A cleared", show_alert=True)
+        return
+
+    if data == "cust:clr_b":
+        if not is_admin(user.id): return
+        await clear_welcome_media("b")
+        await q.answer("🗑 Media B cleared", show_alert=True)
+        return
+
+    if data == "cust:preview":
+        text, mid, mt = await build_welcome(user)
+        await send_rich_or_fallback(context.bot, user.id, text, mid, mt)
+        await q.answer("👁 Preview sent")
+        return
+
+    if data == "cust:brand":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"set_brand"}
+        await context.bot.send_message(user.id,
+            "🏷 <b>Send new brand name:</b>", parse_mode=ParseMode.HTML)
+        return
+
+    # ══ USERS ═════════════════════════════════════════════════
+    if data == "user:grant":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"grant_user"}
+        await context.bot.send_message(user.id, "📨 Send User ID to grant access:")
+        return
+
+    if data == "user:revoke":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"revoke_user"}
+        await context.bot.send_message(user.id, "🚫 Send User ID to revoke access:")
+        return
+
+    if data == "user:add_admin":
+        if user.id != OWNER_ID: return
+        pending_action[user.id] = {"action":"add_admin"}
+        await context.bot.send_message(user.id, "👑 Send User ID to make admin:")
+        return
+
+    if data.startswith("user:list:"):
+        if not is_admin(user.id): return
+        page = int(data.split(":")[-1])
+        per  = 10
+        items = list(allowed_users)
+        chunk = items[page*per:(page+1)*per]
+        total_pages = max(1,(len(items)+per-1)//per)
+        lines = [f"🔑 <code>{uid}</code>" for uid in chunk]
+        text  = ui_screen("👥","Allowed Users",
+            ui_box("\n".join(lines) if lines else "📭 None."),
+            subtitle=f"Page {page+1}/{total_pages}")
+        nav = []
+        if page > 0: nav.append(_ikb("⬅️", callback_data=f"user:list:{page-1}", style="primary"))
+        if page < total_pages-1: nav.append(_ikb("➡️", callback_data=f"user:list:{page+1}", style="primary"))
+        rows_kb = [nav] if nav else []
+        rows_kb.append(back_row("admin:home"))
+        try: await q.edit_message_text(text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows_kb))
+        except BadRequest: pass
+        return
+
+    if data == "user:broadcast":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"broadcast"}
+        await context.bot.send_message(user.id,
+            "📡 <b>Send broadcast message:</b>\n<i>HTML formatting supported.</i>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if data == "user:search":
+        if not is_admin(user.id): return
+        await q.answer("🔍 Use /id or search by username — coming in next update", show_alert=True)
+        return
+
+    # ══ BAN MANAGER ═══════════════════════════════════════════
+    if data == "ban:add":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"ban_user"}
+        await context.bot.send_message(user.id,
+            "🚫 <b>Send ban info:</b>\n<code>USER_ID [hours] [reason]</code>\n\n"
+            "<i>hours=0 means permanent</i>", parse_mode=ParseMode.HTML)
+        return
+
+    if data == "ban:remove":
+        if not is_admin(user.id): return
+        pending_action[user.id] = {"action":"unban_user"}
+        await context.bot.send_message(user.id, "✅ Send User ID to unban:")
+        return
+
+    if data.startswith("ban:list:"):
+        if not is_admin(user.id): return
+        page = int(data.split(":")[-1])
+        per  = 8
